@@ -1,2 +1,2 @@
 # Bayesian_Analysis_Project
-This repository contains the material related to the Bayesian Analysis Exam project.
+This repository contains the material related to the Bayesian Analysis Exam project. The project features the implementation of two main models estimated with Bayesian methods. The two models are used to make forecasts about the prices of Bitcoin and Ethereum using different indexes such as the US Dollar index, the VIX index, etc. The two models estimated are a Bayesian VAR-X model and a Bayesian Random Walk with drift. The models and the associated priors have been modeled using Stan. 
