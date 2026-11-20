@@ -1,0 +1,1087 @@
+---
+title: "Bayesian Analysis Project"
+output: html_document
+date: "2026-04-19"
+---
+
+
+
+## Packages
+
+```{r packages}
+library(quantmod)
+library(PerformanceAnalytics)
+library(tidyverse)
+library(tseries)
+library(corrplot)
+library(lmtest)
+library(vars)
+library(rstan)
+library(coda)
+library(posterior)
+library(bayesplot)
+library(shinystan)
+library(forecast)
+library(scoringRules)
+library(mvtnorm)
+library(zoo)
+library(reshape2)
+```
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+options(mc.cores = max(1, parallel::detectCores() - 1))
+rstan_options(auto_write = TRUE)
+```
+
+
+
+## 1. Data acquisition, transformation and visualization
+
+We download daily prices from Yahoo Finance starting from January 1, 2018 for:
+
+- `BTC-USD` for Bitcoin
+- `ETH-USD` for Ethereum
+- `DX-Y.NYB` for the US Dollar Index
+- `^VIX` for the VIX index
+- `^IXIC` for the NASDAQ index
+- `^IRX` for the IRX index
+
+```{r download-data}
+start_date <- as.Date("2018-01-01")
+end_date   <- Sys.Date()
+
+symbols <- c("BTC-USD", "ETH-USD", "DX-Y.NYB", "^VIX", "^IXIC", "^IRX")
+getSymbols(symbols, src = "yahoo", from = start_date, to = end_date)
+
+btc_px <- Ad(`BTC-USD`)
+eth_px <- Ad(`ETH-USD`)
+dxy_px <- Ad(`DX-Y.NYB`)
+vix_px <- Ad(`VIX`)
+nas_px <- Ad(`IXIC`)
+irx_px <- Ad(`IRX`)
+
+# Macro series do not contain weekend observations, so we align all series on common dates.
+prices <- na.omit(merge(btc_px, eth_px, dxy_px, vix_px, nas_px, irx_px))
+colnames(prices) <- c("BTC", "ETH", "DXY", "VIX", "NASDAQ", "IRX")
+head(prices)
+```
+
+```{r plot-prices}
+autoplot.zoo <- function(z, main = NULL) {
+  df <- fortify.zoo(z)
+  colnames(df)[1] <- "Date"
+  df_long <- pivot_longer(df, -Date, names_to = "Series", values_to = "Value")
+
+  ggplot(df_long, aes(Date, Value, color = Series)) +
+    geom_line() +
+    facet_wrap(~ Series, scales = "free_y") +
+    theme_minimal() +
+    labs(title = main, x = NULL, y = NULL) +
+    theme(legend.position = "none")
+}
+
+autoplot.zoo(prices, main = "Adjusted close prices")
+```
+
+### Computing log returns
+
+```{r returns}
+returns <- na.omit(diff(log(prices)))
+colnames(returns) <- c("r_btc", "r_eth", "r_dxy", "r_vix", "r_nasdaq", "r_irx")
+head(returns)
+```
+
+```{r summary-returns}
+charts.PerformanceSummary(
+  returns[, c("r_btc", "r_eth", "r_dxy", "r_vix", "r_nasdaq", "r_irx")],
+  main = "Returns summary: BTC, ETH, DXY, VIX, NASDAQ, IRX"
+)
+```
+
+```{r plot-returns}
+plot(returns)
+```
+
+### Stationarity
+
+```{r stationarity}
+adf_results <- lapply(as.data.frame(returns), function(x) adf.test(na.omit(x)))
+adf_results
+```
+
+## 2. Exploratory analysis
+
+### Correlation
+
+```{r correlations}
+corrplot(
+  cor(returns),
+  method = "color",
+  type = "upper",
+  addCoef.col = "black",
+  number.cex = 0.8,
+  tl.col = "black",
+  tl.srt = 45,
+  col = colorRampPalette(c("#2c7bb6", "white", "#d7191c"))(200),
+  diag = FALSE
+)
+```
+
+
+### ACF and PACF
+
+```{r acf-plots}
+par(mfrow = c(3, 2), mar = c(4, 4, 3, 1))
+acf(returns$r_btc, main = "ACF BTC")
+acf(returns$r_eth, main = "ACF ETH")
+acf(returns$r_dxy, main = "ACF DXY")
+acf(returns$r_vix, main = "ACF VIX")
+acf(returns$r_nasdaq, main = "ACF NASDAQ")
+acf(returns$r_irx, main = "ACF IRX")
+par(mfrow = c(1, 1))
+```
+
+```{r pacf-plots}
+par(mfrow = c(3, 2), mar = c(4, 4, 3, 1))
+pacf(returns$r_btc, main = "PACF BTC")
+pacf(returns$r_eth, main = "PACF ETH")
+pacf(returns$r_dxy, main = "PACF DXY")
+pacf(returns$r_vix, main = "PACF VIX")
+pacf(returns$r_nasdaq, main = "PACF NASDAQ")
+pacf(returns$r_irx, main = "PACF IRX")
+par(mfrow = c(1, 1))
+```
+
+### Lag selection
+
+```{r lag-selection}
+lag_selection <- VARselect(returns[, c("r_btc", "r_eth")], lag.max = 10)
+lag_selection
+```
+
+```{r lag-selection-plot}
+ic <- data.frame(
+  lag = 1:10,
+  AIC = lag_selection$criteria["AIC(n)", ],
+  BIC = lag_selection$criteria["SC(n)", ],
+  HQ  = lag_selection$criteria["HQ(n)", ]
+)
+
+ic_long <- pivot_longer(
+  ic,
+  cols = c(AIC, BIC, HQ),
+  names_to = "criterion",
+  values_to = "value"
+)
+
+ggplot(ic_long, aes(x = lag, y = value, color = criterion)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  theme_minimal() +
+  labs(title = "Lag selection criteria", x = "Lag", y = "Value")
+```
+
+### Granger causality
+
+```{r granger-tests}
+g1 <- grangertest(r_btc ~ r_dxy,    order = 5, data = returns)
+g2 <- grangertest(r_btc ~ r_vix,    order = 5, data = returns)
+g3 <- grangertest(r_btc ~ r_nasdaq, order = 5, data = returns)
+g4 <- grangertest(r_btc ~ r_irx,    order = 5, data = returns)
+g5 <- grangertest(r_eth ~ r_dxy,    order = 5, data = returns)
+g6 <- grangertest(r_eth ~ r_vix,    order = 5, data = returns)
+g7 <- grangertest(r_eth ~ r_nasdaq, order = 5, data = returns)
+g8 <- grangertest(r_eth ~ r_irx,    order = 5, data = returns)
+
+g1; g2; g3; g4; g5; g6; g7; g8
+```
+
+## 3. Bayesian VAR-X model
+
+### Organizing the data for Stan
+
+We work in percentage returns for interpretability. This scaling is done **once only** here, avoiding the double-scaling issue in the rolling forecast section.
+
+```{r prepare-data-stan}
+returns_percentage <- returns * 100
+data_mat <- as.matrix(returns_percentage)
+n_total <- nrow(data_mat)
+
+# Endogenous variables at time t
+Y <- data_mat[-1, c("r_btc", "r_eth")]
+
+# Lagged predictors available at time t-1
+X_lagged <- data_mat[-n_total, ]
+
+# Design matrix with intercept
+X <- cbind(Intercept = 1, X_lagged)
+
+cat("Checking alignment of dates:\n")
+cat("Prediction for day:", rownames(Y)[1], "\n")
+cat("Based on data of day:", rownames(X)[1], "\n")
+```
+
+
+```{r stan-data}
+stan_data <- list(
+  T = nrow(Y),
+  K = ncol(X),
+  M = ncol(Y),
+  X = as.matrix(X),
+  y = as.matrix(Y)
+)
+```
+
+### Compiling the model
+
+The revised Stan specification uses a non-centered prior for coefficients and an LKJ prior for the correlation structure of the covariance matrix.
+
+```{r compile-model}
+compiled_model <- stan_model(file = "bvarx_lkj_final.stan")
+```
+
+### Posterior sampling
+
+```{r fit-model}
+fit_test <- sampling(
+  compiled_model,
+  data = stan_data,
+  iter = 2000,
+  warmup = 1000,
+  chains = 4,
+  thin = 2,
+  seed = 123,
+  control = list(adapt_delta = 0.99, max_treedepth = 12)
+)
+```
+
+## 4. Model diagnostics
+
+### Posterior summary
+
+```{r posterior-summary}
+print(fit_test, pars = c("tau", "sigma", "L_Omega", "z_beta", "Omega", "beta"), digits = 4)
+```
+
+### R-hat and effective sample size (diagnostic only for sampled coefficients)
+
+```{r diagnostics-summary}
+draws_df <- posterior::as_draws_df(fit_test)
+
+diag_summary <- posterior::summarise_draws(
+  draws_df,
+  mean,
+  sd,
+  median,
+  rhat,
+  ess_bulk,
+  ess_tail
+)
+
+head(diag_summary, 20)
+```
+
+### Traceplots (only for the sampled coefficients)
+
+```{r traceplots}
+posterior_array <- as.array(fit_test)
+all_zbeta <- grep("^z_beta", dimnames(posterior_array)[[3]], value = TRUE)
+btc_zbeta <- all_zbeta[grep(",1\\]", all_zbeta)]
+eth_zbeta <- all_zbeta[grep(",2\\]", all_zbeta)]
+other_params <- c(
+  "tau",
+  "sigma[1]",
+  "sigma[2]",
+  grep("^L_Omega", dimnames(posterior_array)[[3]], value = TRUE)
+)
+
+# TRACE BTC
+mcmc_trace(posterior_array,
+           pars = btc_zbeta,
+           facet_args = list(ncol = 2)) +
+  theme_minimal() +
+  ggtitle("Traceplots: z_beta BTC")
+
+
+# TRACE ETH
+mcmc_trace(posterior_array,
+           pars = eth_zbeta,
+           facet_args = list(ncol = 2)) +
+  theme_minimal() +
+  ggtitle("Traceplots: z_beta ETH")
+
+# TRACE GLOBALI
+mcmc_trace(posterior_array,
+           pars = other_params,
+           facet_args = list(ncol = 2)) +
+  theme_minimal() +
+  ggtitle("Traceplots: tau, sigma, L_Omega")
+```
+Tr
+
+
+
+### Geweke diagnostic
+Here Geweke is done on all parameters, but tipically you need to check only the parameters that have been sampled (so z_beta and L_Omega)
+```{r geweke-diagnostic}
+posterior_array <- rstan::extract(fit_test, permuted = FALSE, inc_warmup = FALSE)
+n_iter <- dim(posterior_array)[1]
+n_chains <- dim(posterior_array)[2]
+param_names <- dimnames(posterior_array)[[3]]
+
+
+selected_idx <- seq_along(param_names)
+
+geweke_results <- lapply(selected_idx, function(j) {
+
+  z_by_chain <- sapply(1:n_chains, function(ch) {
+    coda::geweke.diag(
+      coda::as.mcmc(posterior_array[, ch, j])
+    )$z
+  })
+
+  data.frame(
+    parameter = param_names[j],
+    chain = 1:n_chains,
+    geweke_z = z_by_chain
+  )
+}) %>% dplyr::bind_rows()
+
+
+geweke_results
+```
+
+###Showing only the problematic parameters
+```{r}
+problematic_params <- geweke_results %>%
+  dplyr::group_by(parameter) %>%
+  dplyr::summarise(max_abs_z = max(abs(geweke_z))) %>%
+  dplyr::filter(max_abs_z > 1.96)
+
+problematic_params
+```
+
+
+
+### HMC diagnostics and divergent transitions
+
+```{r hmc-diagnostics}
+check_hmc_diagnostics(fit_test)
+
+sampler_params <- get_sampler_params(fit_test, inc_warmup = FALSE)
+n_divergent <- sum(sapply(sampler_params, function(x) sum(x[, "divergent__"])))
+cat("Number of divergent transitions:", n_divergent, "\n")
+```
+
+
+### ACF check for sampled coefficients
+z_beta of BTC
+```{r mcmc-acf}
+mcmc_acf(as.array(fit_test),
+         pars = btc_zbeta) +
+  theme_minimal() +
+  ggtitle("ACF: BTC z_beta coefficients")
+```
+z_beta of ETH
+```{r}
+mcmc_acf(as.array(fit_test),
+         pars = eth_zbeta) +
+  theme_minimal() +
+  ggtitle("ACF: ETH z_beta coefficients")
+```
+tau, sigma and L_Omega
+```{r}
+mcmc_acf(as.array(fit_test),
+         pars = other_params) +
+  theme_minimal() +
+  ggtitle("ACF: tau, sigma, L_Omega")
+```
+
+
+### Interactive diagnostics with Shinystan
+
+This chunk is intentionally kept in the file because it is useful, but not evaluated during knitting.
+
+```{r shinystan, eval=FALSE}
+library(shinystan)
+launch_shinystan(fit_test)
+```
+
+### Coefficient plots
+
+This version avoids the `NextMethod()` plotting issue by using `bayesplot` directly instead of adding `ggplot` layers to `plot.stanfit()`.
+
+```{r coefficient-intervals-btc}
+btc_betas <- paste0("beta[", 1:ncol(X), ",1]")
+
+mcmc_intervals(
+  as.array(fit_test),
+  pars = btc_betas,
+  prob = 0.8,
+  prob_outer = 0.95
+) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  ggtitle("Posterior intervals of predictive coefficients for Bitcoin")
+```
+
+```{r coefficient-intervals-eth}
+eth_betas <- paste0("beta[", 1:ncol(X), ",2]")
+
+mcmc_intervals(
+  as.array(fit_test),
+  pars = eth_betas,
+  prob = 0.8,
+  prob_outer = 0.95
+) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  ggtitle("Posterior intervals of predictive coefficients for Ethereum")
+```
+Distribution of betas for btc
+```{r coefficient-areas}
+mcmc_areas(as.array(fit_test), pars = btc_betas, prob = 0.95) +
+  ggtitle("Posterior densities of Bitcoin coefficients")
+```
+
+```{r}
+mcmc_areas(as.array(fit_test), pars = eth_betas, prob = 0.95) +
+  ggtitle("Posterior densities of Ethereum coefficients")
+```
+
+###Interpretation of Omega
+
+
+Correlation Matrix showing the residual correlation between btc and eth, so the shared dynamic of eth and btc that the model is not able to capture (that is all the correlation between the 2 because every coefficient is equal to zero)
+```{r}
+all_Omega <- grep("^Omega", dimnames(posterior_array)[[3]], value = TRUE)
+omega_idx <- grep("^Omega", dimnames(posterior_array)[[3]])
+Omega_samples <- posterior_array[, , omega_idx]
+Omega_samples_2d <- matrix(
+  Omega_samples,
+  nrow = dim(Omega_samples)[1] * dim(Omega_samples)[2],
+  ncol = dim(Omega_samples)[3]
+)
+M <- sqrt(dim(Omega_samples_2d)[2])
+
+Omega_array <- array(NA, dim = c(nrow(Omega_samples_2d), M, M))
+
+for (i in 1:nrow(Omega_samples_2d)) {
+  Omega_array[i,,] <- matrix(Omega_samples_2d[i,], M, M)
+}
+
+Omega_mean <- apply(Omega_array, c(2,3), mean)
+omega_mean_long <- melt(Omega_mean)
+
+
+ggplot(omega_mean_long, aes(Var1, Var2, fill = value)) +
+  geom_tile() +
+  geom_text(aes(label = round(value, 2)), size = 4) +
+  scale_fill_gradient2(
+    low = "blue",
+    mid = "white",
+    high = "red",
+    limits = c(-1, 1)
+  ) +
+  coord_equal() +
+  theme_minimal() +
+  labs(
+    title = "Posterior mean of Ω",
+    x = "",
+    y = "",
+    fill = "corr"
+  )
+```
+
+
+
+### Residual diagnostics
+
+Ljung-Box is applied to model residuals rather than to the original return series.
+
+```{r residual-diagnostics}
+beta_post_mean <- apply(rstan::extract(fit_test, pars = "beta")$beta, c(2, 3), mean)
+y_hat <- X %*% beta_post_mean
+resid_mat <- Y - y_hat
+colnames(resid_mat) <- c("BTC", "ETH")
+
+Box.test(resid_mat[, "BTC"], lag = 10, type = "Ljung-Box")
+Box.test(resid_mat[, "ETH"], lag = 10, type = "Ljung-Box")
+
+par(mfrow = c(2, 2))
+acf(resid_mat[, "BTC"], main = "ACF residuals BTC")
+pacf(resid_mat[, "BTC"], main = "PACF residuals BTC")
+acf(resid_mat[, "ETH"], main = "ACF residuals ETH")
+pacf(resid_mat[, "ETH"], main = "PACF residuals ETH")
+par(mfrow = c(1, 1))
+```
+
+## 5. Out-of-sample forecasting
+
+We use a rolling window of fixed size equal to 500 observations. The benchmark is the no-change forecast for returns, which corresponds to the random-walk benchmark on prices.
+
+```{r rolling-forecast}
+window_size <- 500
+n_forecasts <- 30
+total_obs <- nrow(Y)
+start_idx <- total_obs - n_forecasts
+
+forecast_results <- matrix(NA, nrow = n_forecasts, ncol = 2)
+colnames(forecast_results) <- c("pred_btc", "pred_eth")
+
+tau_history <- numeric(n_forecasts)
+pred_draws_btc <- NULL
+pred_draws_eth <- NULL
+
+cat("Starting rolling window forecasting...\n")
+
+for (i in 1:n_forecasts) {
+  current_end <- start_idx + i - 1
+  current_start <- current_end - window_size + 1
+
+  Y_rolling <- Y[current_start:current_end, ]
+  X_rolling <- X[current_start:current_end, ]
+
+  stan_data_rolling <- list(
+    T = nrow(Y_rolling),
+    K = ncol(X_rolling),
+    M = ncol(Y_rolling),
+    X = X_rolling,
+    y = Y_rolling
+  )
+
+  fit_rolling <- sampling(
+    compiled_model,
+    data = stan_data_rolling,
+    iter = 1000,
+    warmup = 500,
+    chains = 2,
+    thin = 2,
+    refresh = 0,
+    seed = 100 + i,
+    control = list(adapt_delta = 0.99, max_treedepth = 12)
+  )
+
+  beta_draws <- rstan::extract(fit_rolling, pars = "beta")$beta
+  sigma_draws <- rstan::extract(fit_rolling, pars = "sigma")$sigma
+  L_Omega_draws <- rstan::extract(fit_rolling, pars = "L_Omega")$L_Omega
+  n_draws <- dim(beta_draws)[1]
+
+  if (i == 1) {
+    pred_draws_btc <- matrix(NA, nrow = n_forecasts, ncol = n_draws)
+    pred_draws_eth <- matrix(NA, nrow = n_forecasts, ncol = n_draws)
+  }
+
+  tau_history[i] <- mean(rstan::extract(fit_rolling, pars = "tau")$tau)
+
+  X_next <- X[current_end + 1, , drop = FALSE]
+
+  for (s in 1:n_draws) {
+    beta_s <- beta_draws[s, , ]
+    mu_s <- as.numeric(X_next %*% beta_s)
+    L_Omega_s <- L_Omega_draws[s, , ]
+    Sigma_s <- diag(sigma_draws[s, ]) %*% (L_Omega_s %*% t(L_Omega_s)) %*% diag(sigma_draws[s, ])
+    y_pred_s <- mvtnorm::rmvnorm(1, mean = mu_s, sigma = Sigma_s)
+
+    pred_draws_btc[i, s] <- y_pred_s[1]
+    pred_draws_eth[i, s] <- y_pred_s[2]
+  }
+
+  forecast_results[i, 1] <- mean(pred_draws_btc[i, ])
+  forecast_results[i, 2] <- mean(pred_draws_eth[i, ])
+
+  cat("Forecast", i, "of", n_forecasts, "completed.\n")
+}
+
+real_values <- Y[(start_idx + 1):(start_idx + n_forecasts), ]
+errori <- real_values - forecast_results
+```
+
+### Plotting forecasts
+
+```{r plot-forecasts}
+dates_forecast <- as.Date(rownames(real_values))
+real_btc <- as.numeric(real_values[, 1])
+real_eth <- as.numeric(real_values[, 2])
+pred_btc <- forecast_results[, 1]
+pred_eth <- forecast_results[, 2]
+
+par(mfrow = c(2, 1), mar = c(4, 4, 2, 1))
+
+max_y_btc <- max(abs(c(real_btc, pred_btc)), na.rm = TRUE) * 1.3
+plot(dates_forecast, real_btc,
+     type = "l", col = "gray60", lwd = 2,
+     ylim = c(-max_y_btc, max_y_btc),
+     main = "Bitcoin: Real vs Predicted Returns",
+     xlab = "", ylab = "Returns (%)", xaxt = "n")
+lines(dates_forecast, pred_btc, col = "blue", lwd = 2)
+abline(h = 0, lty = 2)
+axis.Date(1, at = seq(min(dates_forecast), max(dates_forecast), by = "1 week"), format = "%d %b")
+legend("topright", legend = c("Real", "Prediction"), col = c("gray60", "blue"), lwd = 2, bty = "n")
+
+max_y_eth <- max(abs(c(real_eth, pred_eth)), na.rm = TRUE) * 1.3
+plot(dates_forecast, real_eth,
+     type = "l", col = "gray60", lwd = 2,
+     ylim = c(-max_y_eth, max_y_eth),
+     main = "Ethereum: Real vs Predicted Returns",
+     xlab = "Date", ylab = "Returns (%)", xaxt = "n")
+lines(dates_forecast, pred_eth, col = "red", lwd = 2)
+abline(h = 0, lty = 2)
+axis.Date(1, at = seq(min(dates_forecast), max(dates_forecast), by = "1 week"), format = "%d %b")
+legend("topright", legend = c("Real", "Prediction"), col = c("gray60", "red"), lwd = 2, bty = "n")
+
+par(mfrow = c(1, 1))
+```
+
+## 6. Forecast evaluation
+
+### Point forecast metrics
+
+```{r point-metrics}
+errors_btc <- real_btc - pred_btc
+errors_eth <- real_eth - pred_eth
+
+rmsfe_btc <- sqrt(mean(errors_btc^2))
+rmsfe_eth <- sqrt(mean(errors_eth^2))
+
+mae_btc <- mean(abs(errors_btc))
+mae_eth <- mean(abs(errors_eth))
+
+cat("RMSFE Bitcoin:", round(rmsfe_btc, 4), "\n")
+cat("RMSFE Ethereum:", round(rmsfe_eth, 4), "\n")
+cat("MAE Bitcoin:", round(mae_btc, 4), "\n")
+cat("MAE Ethereum:", round(mae_eth, 4), "\n")
+```
+
+### Random-walk benchmark on prices / zero-return benchmark on returns
+
+```{r benchmark-metrics}
+rw_pred_btc <- rep(0, n_forecasts)
+rw_pred_eth <- rep(0, n_forecasts)
+
+rw_errors_btc <- real_btc - rw_pred_btc
+rw_errors_eth <- real_eth - rw_pred_eth
+
+rmsfe_rw_btc <- sqrt(mean(rw_errors_btc^2))
+rmsfe_rw_eth <- sqrt(mean(rw_errors_eth^2))
+
+rel_rmsfe_btc <- rmsfe_btc / rmsfe_rw_btc
+rel_rmsfe_eth <- rmsfe_eth / rmsfe_rw_eth
+
+cat("Benchmark RMSFE Bitcoin:", round(rmsfe_rw_btc, 4), "\n")
+cat("Benchmark RMSFE Ethereum:", round(rmsfe_rw_eth, 4), "\n")
+cat("Relative RMSFE Bitcoin:", round(rel_rmsfe_btc, 4), "\n")
+cat("Relative RMSFE Ethereum:", round(rel_rmsfe_eth, 4), "\n")
+```
+
+### CRPS
+
+```{r crps}
+crps_btc <- mean(scoringRules::crps_sample(y = real_btc, dat = pred_draws_btc))
+crps_eth <- mean(scoringRules::crps_sample(y = real_eth, dat = pred_draws_eth))
+
+cat("Mean CRPS Bitcoin:", round(crps_btc, 4), "\n")
+cat("Mean CRPS Ethereum:", round(crps_eth, 4), "\n")
+```
+
+### Coverage of predictive intervals
+
+```{r coverage}
+lower_btc <- apply(pred_draws_btc, 1, quantile, probs = 0.05)
+upper_btc <- apply(pred_draws_btc, 1, quantile, probs = 0.95)
+lower_eth <- apply(pred_draws_eth, 1, quantile, probs = 0.05)
+upper_eth <- apply(pred_draws_eth, 1, quantile, probs = 0.95)
+
+coverage_btc <- mean(real_btc >= lower_btc & real_btc <= upper_btc)
+coverage_eth <- mean(real_eth >= lower_eth & real_eth <= upper_eth)
+
+cat("90% interval coverage BTC:", round(coverage_btc, 4), "\n")
+cat("90% interval coverage ETH:", round(coverage_eth, 4), "\n")
+```
+
+### Hit ratio
+
+```{r hit-ratio}
+hit_btc <- mean(sign(real_btc) == sign(pred_btc))
+hit_eth <- mean(sign(real_eth) == sign(pred_eth))
+
+cat("Hit Ratio BTC:", round(hit_btc * 100, 2), "%\n")
+cat("Hit Ratio ETH:", round(hit_eth * 100, 2), "%\n")
+```
+
+### Diebold-Mariano test against the benchmark
+
+```{r dm-test}
+dm_test_btc <- dm.test(errors_btc, rw_errors_btc, h = 1, alternative = "two.sided")
+dm_test_eth <- dm.test(errors_eth, rw_errors_eth, h = 1, alternative = "two.sided")
+
+print(dm_test_btc)
+print(dm_test_eth)
+```
+
+
+
+## 7. Bayesian random walk benchmark
+
+As an additional Bayesian benchmark, we estimate a random walk with drift model for **log-prices**. This is more coherent than imposing a random walk directly on returns. The one-step-ahead posterior predictive draw for the next log-price is then transformed into a return forecast.
+
+### Compiling the Bayesian random walk model
+
+```{r compile-bayesian-rw}
+rw_model <- stan_model(file = "bayesian_rw_final.stan")
+```
+
+### Single full-sample estimation
+
+```{r fit-bayesian-rw-full}
+btc_logp <- as.numeric(log(prices$BTC))
+eth_logp <- as.numeric(log(prices$ETH))
+
+stan_data_rw_btc <- list(
+  T = length(btc_logp),
+  y = btc_logp
+)
+
+stan_data_rw_eth <- list(
+  T = length(eth_logp),
+  y = eth_logp
+)
+
+fit_rw_btc <- sampling(
+  rw_model,
+  data = stan_data_rw_btc,
+  chains = 4,
+  iter = 2000,
+  warmup = 1000,
+  seed = 321,
+  refresh = 0,
+  control = list(adapt_delta = 0.95)
+)
+
+fit_rw_eth <- sampling(
+  rw_model,
+  data = stan_data_rw_eth,
+  chains = 4,
+  iter = 2000,
+  warmup = 1000,
+  seed = 654,
+  refresh = 0,
+  control = list(adapt_delta = 0.95)
+)
+
+print(fit_rw_btc, pars = c("sigma"))
+print(fit_rw_eth, pars = c("sigma"))
+```
+
+### Bayesian random walk diagnostics
+
+```{r diagnostics-bayesian-rw}
+rw_diag_btc <- posterior::summarise_draws(
+  posterior::as_draws_df(fit_rw_btc),
+  mean, sd, median, rhat, ess_bulk, ess_tail
+)
+
+rw_diag_eth <- posterior::summarise_draws(
+  posterior::as_draws_df(fit_rw_eth),
+  mean, sd, median, rhat, ess_bulk, ess_tail
+)
+
+rw_diag_btc
+rw_diag_eth
+```
+
+###Traceplot of mu and sigma for btc and eth
+
+```{r}
+posterior_array_btc <- as.array(fit_rw_btc)
+
+mcmc_trace(posterior_array_btc, 
+           pars = c("mu", "sigma"),
+           facet_args = list(ncol = 1)) +
+  theme_minimal() +
+  ggtitle("Traceplots Random Walk BTC: mu and sigma")
+
+
+posterior_array_eth <- as.array(fit_rw_eth)
+
+mcmc_trace(posterior_array_eth, 
+           pars = c("mu", "sigma"),
+           facet_args = list(ncol = 1)) +
+  theme_minimal() +
+  ggtitle("Traceplots Random Walk ETH: mu and sigma")
+```
+
+
+###ACF
+
+```{r}
+# ACF per BTC: mu e sigma
+mcmc_acf(as.array(fit_rw_btc), 
+         pars = c("mu", "sigma")) +
+  theme_minimal() +
+  ggtitle("ACF Random Walk BTC: mu and sigma")
+  # ACF per ETH: mu e sigma
+mcmc_acf(as.array(fit_rw_eth), 
+         pars = c("mu", "sigma")) +
+  theme_minimal() +
+  ggtitle("ACF Random Walk ETH: mu and sigma")
+
+```
+
+###Geweke test
+
+```{r}
+# Estrazione array (permuted = FALSE è fondamentale per mantenere le catene separate)
+posterior_array_btc <- rstan::extract(fit_rw_btc, permuted = FALSE, inc_warmup = FALSE)
+n_chains <- dim(posterior_array_btc)[2]
+param_names_rw <- dimnames(posterior_array_btc)[[3]]
+
+# Selezione solo di mu e sigma (escludendo y_next e log_lik per pulizia)
+idx_rw <- which(param_names_rw %in% c("mu", "sigma"))
+
+geweke_btc <- lapply(idx_rw, function(j) {
+  z_by_chain <- sapply(1:n_chains, function(ch) {
+    coda::geweke.diag(coda::as.mcmc(posterior_array_btc[, ch, j]))$z
+  })
+  
+  data.frame(
+    parameter = param_names_rw[j],
+    chain = 1:n_chains,
+    geweke_z = z_by_chain
+  )
+}) %>% bind_rows()
+
+print("Geweke Test Results - BTC")
+print(geweke_btc)
+
+posterior_array_eth <- rstan::extract(fit_rw_eth, permuted = FALSE, inc_warmup = FALSE)
+
+geweke_eth <- lapply(idx_rw, function(j) {
+  z_by_chain <- sapply(1:n_chains, function(ch) {
+    coda::geweke.diag(coda::as.mcmc(posterior_array_eth[, ch, j]))$z
+  })
+  
+  data.frame(
+    parameter = param_names_rw[j],
+    chain = 1:n_chains,
+    geweke_z = z_by_chain
+  )
+}) %>% bind_rows()
+
+print("Geweke Test Results - ETH")
+print(geweke_eth)
+```
+
+
+
+###Divergences
+```{r rw-divergences}
+sp_rw_btc <- get_sampler_params(fit_rw_btc, inc_warmup = FALSE)
+sp_rw_eth <- get_sampler_params(fit_rw_eth, inc_warmup = FALSE)
+
+n_div_rw_btc <- sum(sapply(sp_rw_btc, function(x) sum(x[, "divergent__"])))
+n_div_rw_eth <- sum(sapply(sp_rw_eth, function(x) sum(x[, "divergent__"])))
+
+cat("Bayesian RW divergences BTC:", n_div_rw_btc, "\n")
+cat("Bayesian RW divergences ETH:", n_div_rw_eth, "\n")
+```
+
+### Rolling Bayesian random walk forecasts
+
+```{r rolling-bayesian-rw}
+bayesian_rw_rolling <- function(log_prices, train_size = 500,
+                                n_forecasts = 30,
+                                iter = 1000, warmup = 500,
+                                chains = 2, seed = 900) {
+  n <- length(log_prices)
+  stopifnot(train_size + n_forecasts <= n)
+
+  point_forecasts_ret <- numeric(n_forecasts)
+  actual_returns <- numeric(n_forecasts)
+  pred_draws_ret <- vector("list", n_forecasts)
+
+  for (i in 1:n_forecasts) {
+    end_idx <- train_size + i - 1
+    y_train <- log_prices[1:end_idx]
+
+    stan_data <- list(
+      T = length(y_train),
+      y = y_train
+    )
+
+    fit_rw <- sampling(
+      rw_model,
+      data = stan_data,
+      chains = chains,
+      iter = iter,
+      warmup = warmup,
+      seed = seed + i,
+      refresh = 0,
+      control = list(adapt_delta = 0.95)
+    )
+
+    post <- rstan::extract(fit_rw)
+    y_next_draws <- post$y_next
+
+    last_logp <- y_train[length(y_train)]
+    ret_draws <- 100 * (y_next_draws - last_logp)
+
+    pred_draws_ret[[i]] <- ret_draws
+    point_forecasts_ret[i] <- mean(ret_draws)
+
+    actual_returns[i] <- 100 * (log_prices[end_idx + 1] - log_prices[end_idx])
+  }
+
+  max_draws <- max(sapply(pred_draws_ret, length))
+  pred_draws_mat <- matrix(NA_real_, nrow = n_forecasts, ncol = max_draws)
+
+  for (i in 1:n_forecasts) {
+    pred_draws_mat[i, 1:length(pred_draws_ret[[i]])] <- pred_draws_ret[[i]]
+  }
+
+  list(
+    point_forecasts = point_forecasts_ret,
+    actual_returns = actual_returns,
+    pred_draws = pred_draws_mat
+  )
+}
+
+rw_btc_res <- bayesian_rw_rolling(
+  log_prices = as.numeric(log(prices$BTC)),
+  train_size = start_idx,
+  n_forecasts = n_forecasts,
+  iter = 1000,
+  warmup = 500,
+  chains = 2,
+  seed = 111
+)
+
+rw_eth_res <- bayesian_rw_rolling(
+  log_prices = as.numeric(log(prices$ETH)),
+  train_size = start_idx,
+  n_forecasts = n_forecasts,
+  iter = 1000,
+  warmup = 500,
+  chains = 2,
+  seed = 222
+)
+```
+
+### Bayesian random walk evaluation
+
+```{r evaluate-bayesian-rw}
+rw_bayes_errors_btc <- rw_btc_res$actual_returns - rw_btc_res$point_forecasts
+rw_bayes_errors_eth <- rw_eth_res$actual_returns - rw_eth_res$point_forecasts
+
+rw_bayes_rmsfe_btc <- sqrt(mean(rw_bayes_errors_btc^2, na.rm = TRUE))
+rw_bayes_rmsfe_eth <- sqrt(mean(rw_bayes_errors_eth^2, na.rm = TRUE))
+
+rw_bayes_mae_btc <- mean(abs(rw_bayes_errors_btc), na.rm = TRUE)
+rw_bayes_mae_eth <- mean(abs(rw_bayes_errors_eth), na.rm = TRUE)
+
+rw_bayes_crps_btc <- mean(
+  scoringRules::crps_sample(
+    y = rw_btc_res$actual_returns,
+    dat = rw_btc_res$pred_draws
+  ),
+  na.rm = TRUE
+)
+
+rw_bayes_crps_eth <- mean(
+  scoringRules::crps_sample(
+    y = rw_eth_res$actual_returns,
+    dat = rw_eth_res$pred_draws
+  ),
+  na.rm = TRUE
+)
+
+rw_bayes_lower_btc <- apply(rw_btc_res$pred_draws, 1, quantile, probs = 0.05, na.rm = TRUE)
+rw_bayes_upper_btc <- apply(rw_btc_res$pred_draws, 1, quantile, probs = 0.95, na.rm = TRUE)
+rw_bayes_lower_eth <- apply(rw_eth_res$pred_draws, 1, quantile, probs = 0.05, na.rm = TRUE)
+rw_bayes_upper_eth <- apply(rw_eth_res$pred_draws, 1, quantile, probs = 0.95, na.rm = TRUE)
+
+rw_bayes_cov_btc <- mean(
+  rw_btc_res$actual_returns >= rw_bayes_lower_btc &
+    rw_btc_res$actual_returns <= rw_bayes_upper_btc
+)
+
+rw_bayes_cov_eth <- mean(
+  rw_eth_res$actual_returns >= rw_bayes_lower_eth &
+    rw_eth_res$actual_returns <= rw_bayes_upper_eth
+)
+
+cat("Bayesian RW RMSFE BTC:", round(rw_bayes_rmsfe_btc, 4), "\n")
+cat("Bayesian RW RMSFE ETH:", round(rw_bayes_rmsfe_eth, 4), "\n")
+cat("Bayesian RW MAE BTC:", round(rw_bayes_mae_btc, 4), "\n")
+cat("Bayesian RW MAE ETH:", round(rw_bayes_mae_eth, 4), "\n")
+cat("Bayesian RW CRPS BTC:", round(rw_bayes_crps_btc, 4), "\n")
+cat("Bayesian RW CRPS ETH:", round(rw_bayes_crps_eth, 4), "\n")
+cat("Bayesian RW 90% coverage BTC:", round(rw_bayes_cov_btc, 4), "\n")
+cat("Bayesian RW 90% coverage ETH:", round(rw_bayes_cov_eth, 4), "\n")
+```
+
+### Model comparison: BVAR-X versus Bayesian random walk
+
+```{r compare-bvarx-vs-bayesian-rw}
+dm_test_btc_rwbayes <- dm.test(
+  e1 = errors_btc,
+  e2 = rw_bayes_errors_btc,
+  h = 1,
+  alternative = "two.sided"
+)
+
+dm_test_eth_rwbayes <- dm.test(
+  e1 = errors_eth,
+  e2 = rw_bayes_errors_eth,
+  h = 1,
+  alternative = "two.sided"
+)
+
+comparison_table <- tibble::tibble(
+  Model = c("BVAR-X", "Bayesian RW", "BVAR-X", "Bayesian RW"),
+  Asset = c("BTC", "BTC", "ETH", "ETH"),
+  RMSFE = c(rmsfe_btc, rw_bayes_rmsfe_btc, rmsfe_eth, rw_bayes_rmsfe_eth),
+  MAE = c(mae_btc, rw_bayes_mae_btc, mae_eth, rw_bayes_mae_eth),
+  CRPS = c(crps_btc, rw_bayes_crps_btc, crps_eth, rw_bayes_crps_eth)
+)
+
+comparison_table
+
+dm_test_btc_rwbayes
+dm_test_eth_rwbayes
+```
+
+### Plotting Bayesian random walk forecasts
+
+```{r plot-bayesian-rw}
+par(mfrow = c(2, 1), mar = c(4, 4, 2, 1))
+
+max_y_btc_rw <- max(abs(c(rw_btc_res$actual_returns, rw_btc_res$point_forecasts)), na.rm = TRUE) * 1.3
+plot(
+  dates_forecast, rw_btc_res$actual_returns,
+  type = "l", col = "gray60", lwd = 2,
+  ylim = c(-max_y_btc_rw, max_y_btc_rw),
+  main = "Bayesian RW: Bitcoin Real vs Predicted Returns",
+  xlab = "", ylab = "Returns (%)", xaxt = "n"
+)
+lines(dates_forecast, rw_btc_res$point_forecasts, col = "darkgreen", lwd = 2)
+abline(h = 0, lty = 2)
+axis.Date(1, at = seq(min(dates_forecast), max(dates_forecast), by = "1 week"), format = "%d %b")
+legend("topright", legend = c("Real", "Bayesian RW"), col = c("gray60", "darkgreen"), lwd = 2, bty = "n")
+
+max_y_eth_rw <- max(abs(c(rw_eth_res$actual_returns, rw_eth_res$point_forecasts)), na.rm = TRUE) * 1.3
+plot(
+  dates_forecast, rw_eth_res$actual_returns,
+  type = "l", col = "gray60", lwd = 2,
+  ylim = c(-max_y_eth_rw, max_y_eth_rw),
+  main = "Bayesian RW: Ethereum Real vs Predicted Returns",
+  xlab = "Date", ylab = "Returns (%)", xaxt = "n"
+)
+lines(dates_forecast, rw_eth_res$point_forecasts, col = "darkgreen", lwd = 2)
+abline(h = 0, lty = 2)
+axis.Date(1, at = seq(min(dates_forecast), max(dates_forecast), by = "1 week"), format = "%d %b")
+legend("topright", legend = c("Real", "Bayesian RW"), col = c("gray60", "darkgreen"), lwd = 2, bty = "n")
+
+par(mfrow = c(1, 1))
+```
+
